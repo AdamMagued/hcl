@@ -2174,6 +2174,46 @@ cat {
 	}
 }
 
+func TestBodyClear(t *testing.T) {
+	f := NewEmptyFile()
+	body := f.Body()
+
+	body.SetAttributeValue("foo", cty.StringVal("bar"))
+	body.AppendNewBlock("block_type", []string{"label"})
+
+	if len(body.Attributes()) != 1 {
+		t.Fatalf("expected 1 attribute before Clear, got %d", len(body.Attributes()))
+	}
+	if len(body.Blocks()) != 1 {
+		t.Fatalf("expected 1 block before Clear, got %d", len(body.Blocks()))
+	}
+
+	body.Clear()
+
+	if got := len(body.Attributes()); got != 0 {
+		t.Errorf("expected 0 attributes after Clear, got %d", got)
+	}
+	if got := len(body.Blocks()); got != 0 {
+		t.Errorf("expected 0 blocks after Clear, got %d", got)
+	}
+	if attr := body.GetAttribute("foo"); attr != nil {
+		t.Errorf("expected GetAttribute to return nil after Clear, got %#v", attr)
+	}
+
+	body.SetAttributeValue("foo", cty.StringVal("baz"))
+
+	if attr := body.GetAttribute("foo"); attr == nil {
+		t.Fatalf("expected GetAttribute to return attribute after re-setting, got nil")
+	}
+
+	tokens := body.BuildTokens(nil)
+	format(tokens)
+	output := string(tokens.Bytes())
+	if !strings.Contains(output, `foo = "baz"`) {
+		t.Errorf("expected output to contain %q, got %q", `foo = "baz"`, output)
+	}
+}
+
 // testFn is a convenience function that wraps a function call that returns a
 // value and diagnostics.
 //
