@@ -69,6 +69,41 @@ func parse(src []byte, filename string, start hcl.Pos) (*File, hcl.Diagnostics) 
 	return ret, diags
 }
 
+// parseExpr is similar to parse, but is for parsing an expression.
+func parseExpr(src []byte, filename string, start hcl.Pos) (*Expression, hcl.Diagnostics) {
+	expr, diags := hclsyntax.ParseExpression(src, filename, start)
+	if diags.HasErrors() {
+		return nil, diags
+	}
+
+	// To do our work here, we use the "native" tokens (those from hclsyntax)
+	// to match against source ranges in the AST, but ultimately produce
+	// slices from our sequence of "writer" tokens, which contain only
+	// *relative* position information that is more appropriate for
+	// transformation/writing use-cases.
+	nativeTokens, diags := hclsyntax.LexExpression(src, filename, start)
+	if diags.HasErrors() {
+		// should never happen, since we would've caught these diags in
+		// the first call above.
+		return nil, diags
+	}
+
+	// Remove the (synthetic) ending EOF token to avoid it being added up to the parsed Expression.
+	if len(nativeTokens) != 0 && nativeTokens[len(nativeTokens)-1].Type == hclsyntax.TokenEOF {
+		nativeTokens = nativeTokens[:len(nativeTokens)-1]
+	}
+	writerTokens := writerTokens(nativeTokens)
+
+	from := inputTokens{
+		nativeTokens: nativeTokens,
+		writerTokens: writerTokens,
+	}
+	_, within, _ := from.Partition(expr.Range())
+
+	node := parseExpression(expr, within)
+	return node.content.(*Expression), diags
+}
+
 type inputTokens struct {
 	nativeTokens hclsyntax.Tokens
 	writerTokens Tokens
@@ -378,7 +413,9 @@ func parseBlockLabels(nativeBlock *hclsyntax.Block, from inputTokens) (inputToke
 func parseExpression(nativeExpr hclsyntax.Expression, from inputTokens) *node {
 	switch tNativeExpr := nativeExpr.(type) {
 
-	// Object-construct expression
+	case *hclsyntax.FunctionCallExpr:
+		return parseFunctionCallExpr(tNativeExpr, from)
+
 	case *hclsyntax.ObjectConsExpr:
 		return parseObjectConsExpr(tNativeExpr, from)
 
@@ -388,30 +425,56 @@ func parseExpression(nativeExpr hclsyntax.Expression, from inputTokens) *node {
 	case *hclsyntax.TemplateExpr:
 		return parseTemplateExpr(tNativeExpr, from)
 
+	case *hclsyntax.TupleConsExpr:
+		return parseTupleConsExpr(tNativeExpr, from)
+
 	default:
 		return parseAnyExpression(nativeExpr, from)
 	}
 }
 
-func parseAnyExpression(nativeExpr hclsyntax.Expression, from inputTokens) *node {
-	expr := newExpression()
+// parseFunctionCallExpr parses an function call expression, defined as:
+//
+//	 FunctionCall = Identifier "(" arguments ")";
+//
+//		Arguments = (
+//		    () ||
+//		    (Expression ("," Expression)* ("," | "...")?)
+//		);
+//
+// It leaves any lead comments and line comments as unstructured tokens.
+func parseFunctionCallExpr(nativeExpr *hclsyntax.FunctionCallExpr, from inputTokens) *node {
+	expr := newFunctionCallExpr(nativeExpr.Name)
 	children := expr.children
 
-	nativeVars := nativeExpr.Variables()
-
-	for _, nativeTraversal := range nativeVars {
-		before, traversal, after := parseTraversal(nativeTraversal, from)
-		children.AppendUnstructuredTokens(before.Tokens())
-		children.AppendNode(traversal)
-		expr.absTraversals.Add(traversal)
-		from = after
+	if nativeExpr.ExpandFinal {
+		expr.expandFinal = true
 	}
-	// Attach any stragglers that don't belong to a traversal to the expression
-	// itself. In an expression with no traversals at all, this is just the
-	// entirety of "from".
-	children.AppendUnstructuredTokens(from.Tokens())
 
-	return newNode(expr)
+	// Wrap in an Expression
+	wrapExpr := newExpression()
+
+	var before, start, argTokens inputTokens
+
+	before, start, from = from.Partition(nativeExpr.StartRange())
+	children.AppendUnstructuredTokens(before.writerTokens)
+	children.AppendUnstructuredTokens(start.writerTokens)
+
+	for _, nativeArg := range nativeExpr.Args {
+		before, argTokens, from = from.Partition(nativeArg.Range())
+		children.AppendUnstructuredTokens(before.writerTokens)
+
+		arg := parseExpression(nativeArg, argTokens)
+		children.AppendNode(arg)
+		expr.args.Add(arg)
+	}
+
+	// Closing tokens
+	_, from, _ = from.Partition(nativeExpr.Range())
+	children.AppendUnstructuredTokens(from.writerTokens)
+
+	wrapExpr.wrap(expr)
+	return newNode(wrapExpr)
 }
 
 // parseObjectConsExpr parses an object-construct expression, defined as:
@@ -466,10 +529,54 @@ func parseObjectConsExpr(nativeExpr *hclsyntax.ObjectConsExpr, from inputTokens)
 // An object key is an Identifier or an Expression. In this context, a quoted
 // literal is functionally equivalent to an Identifier.
 func parseObjectConsKeyExpr(nativeExpr *hclsyntax.ObjectConsKeyExpr, from inputTokens) *node {
-	expr := parseExpression(nativeExpr.Wrapped, from)
-	wrapExpr := newObjectConsKeyExpr(expr)
+	var objectConsKeyExpr *ObjectConsKeyExpr
 
-	return newNode(wrapExpr)
+	switch wrapped := nativeExpr.Wrapped.(type) {
+
+	// a = {
+	//        hat = "derby" }
+	// => appends ObjectConsKeyExpr => identifier
+	//
+	// a = {
+	//        bat.hat = "derby" }
+	// => appends ObjectConsKeyExpr => Expression
+	case *hclsyntax.ScopeTraversalExpr:
+		if len(from.writerTokens) == 1 {
+			expr := newNode(newIdentifier(from.writerTokens[0]))
+			objectConsKeyExpr = newObjectConsKeyExpr(expr)
+		} else {
+			expr := parseAnyExpression(wrapped, from)
+			objectConsKeyExpr = newObjectConsKeyExpr(expr)
+		}
+
+	// a = {
+	//        (var.hat) = "derby" }
+	// => appends ObjectConsKeyExpr => Expression
+	case *hclsyntax.ParenthesesExpr:
+		expr := parseAnyExpression(wrapped, from)
+		objectConsKeyExpr = newObjectConsKeyExpr(expr)
+
+	// a = {
+	//        "a hat" = "derby" }
+	// => appends ObjectConsKeyExpr => Expression => quoted
+	case *hclsyntax.TemplateExpr:
+		expr := parseTemplateExpr(wrapped, from)
+		objectConsKeyExpr = newObjectConsKeyExpr(expr)
+
+	default:
+		expr := parseAnyExpression(wrapped, from)
+		objectConsKeyExpr = newObjectConsKeyExpr(expr)
+	}
+
+	// A key that hclsyntax interprets as a literal name contributes no
+	// variables, even if it was parsed as an expression.
+	if len(nativeExpr.Variables()) == 0 {
+		if expr, ok := objectConsKeyExpr.wrapped.content.(*Expression); ok {
+			expr.absTraversals.Clear()
+		}
+	}
+
+	return newNode(objectConsKeyExpr)
 }
 
 // parseTemplateExpr is specifically interested in string literal expressions
@@ -484,6 +591,65 @@ func parseTemplateExpr(nativeExpr *hclsyntax.TemplateExpr, from inputTokens) *no
 	} else {
 		return parseAnyExpression(nativeExpr, from)
 	}
+}
+
+// parseTupleConsExpr() parses a tuple-construct expression, defined as:
+//
+//	tuple = "[" (
+//	   (Expression (("," | Newline) Expression)* ","?)?
+//	) "]";
+//
+// It leaves any lead comments and line comments as unstructured tokens.
+func parseTupleConsExpr(nativeExpr *hclsyntax.TupleConsExpr, from inputTokens) *node {
+	tuple := newTupleConsExpr()
+	children := tuple.children
+
+	// Wrap in an Expression
+	wrapExpr := newExpression()
+
+	var before, start, argTokens inputTokens
+
+	before, start, from = from.Partition(nativeExpr.StartRange())
+	children.AppendUnstructuredTokens(before.writerTokens)
+	children.AppendUnstructuredTokens(start.writerTokens)
+
+	for _, nativeExpr := range nativeExpr.Exprs {
+		before, argTokens, from = from.Partition(nativeExpr.Range())
+		children.AppendUnstructuredTokens(before.writerTokens)
+
+		arg := parseExpression(nativeExpr, argTokens)
+		children.AppendNode(arg)
+		tuple.exprs.Add(arg)
+	}
+
+	// Closing tokens
+	_, from, _ = from.Partition(nativeExpr.Range())
+	children.AppendUnstructuredTokens(from.writerTokens)
+
+	wrapExpr.wrap(tuple)
+	return newNode(wrapExpr)
+}
+
+func parseAnyExpression(nativeExpr hclsyntax.Expression, from inputTokens) *node {
+	expr := newExpression()
+	children := expr.children
+
+	nativeVars := nativeExpr.Variables()
+
+	for _, nativeTraversal := range nativeVars {
+		before, traversal, after := parseTraversal(nativeTraversal, from)
+		children.AppendUnstructuredTokens(before.Tokens())
+		children.AppendNode(traversal)
+		expr.absTraversals.Add(traversal)
+		from = after
+	}
+
+	// Attach any stragglers that don't belong to a traversal to the expression
+	// itself. In an expression with no traversals at all, this is just the
+	// entirety of "from".
+	children.AppendUnstructuredTokens(from.Tokens())
+
+	return newNode(expr)
 }
 
 func parseTraversal(nativeTraversal hcl.Traversal, from inputTokens) (before inputTokens, n *node, after inputTokens) {

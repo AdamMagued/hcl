@@ -64,6 +64,13 @@ func (p *peeker) NextRange() hcl.Range {
 
 func (p *peeker) PrevRange() hcl.Range {
 	if p.NextIndex == 0 {
+		if len(p.Tokens) > 0 {
+			return hcl.Range{
+				Filename: p.Tokens[0].Range.Filename,
+				Start:    p.Tokens[0].Range.Start,
+				End:      p.Tokens[0].Range.Start,
+			}
+		}
 		return p.NextRange()
 	}
 

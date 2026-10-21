@@ -6,6 +6,8 @@ package hclsyntax
 import (
 	"reflect"
 	"testing"
+
+	"github.com/hashicorp/hcl/v2"
 )
 
 func init() {
@@ -164,3 +166,57 @@ func TestPeeker(t *testing.T) {
 		}
 	}
 }
+
+func TestPeeker_PrevRange(t *testing.T) {
+	tokens := Tokens{
+		{
+			Type: TokenComment,
+			Range: hcl.Range{
+				Filename: "test.hcl",
+				Start:    hcl.Pos{Line: 1, Column: 1, Byte: 0},
+				End:      hcl.Pos{Line: 3, Column: 4, Byte: 20},
+			},
+		},
+		{
+			Type: TokenIdent,
+			Range: hcl.Range{
+				Filename: "test.hcl",
+				Start:    hcl.Pos{Line: 4, Column: 1, Byte: 21},
+				End:      hcl.Pos{Line: 4, Column: 4, Byte: 24},
+			},
+		},
+		{
+			Type: TokenEOF,
+			Range: hcl.Range{
+				Filename: "test.hcl",
+				Start:    hcl.Pos{Line: 4, Column: 4, Byte: 24},
+				End:      hcl.Pos{Line: 4, Column: 4, Byte: 24},
+			},
+		},
+	}
+
+	p := newPeeker(tokens, false)
+
+	// When p.NextIndex == 0, PrevRange should anchor to the start of the first token.
+	got := p.PrevRange()
+	want := hcl.Range{
+		Filename: "test.hcl",
+		Start:    hcl.Pos{Line: 1, Column: 1, Byte: 0},
+		End:      hcl.Pos{Line: 1, Column: 1, Byte: 0},
+	}
+	if got != want {
+		t.Fatalf("wrong PrevRange at start: got %#v, want %#v", got, want)
+	}
+
+	// Reading the first non-comment token advances NextIndex.
+	tok := p.Read()
+	if tok.Type != TokenIdent {
+		t.Fatalf("expected TokenIdent, got %s", tok.Type)
+	}
+	got = p.PrevRange()
+	want = tokens[1].Range
+	if got != want {
+		t.Fatalf("wrong PrevRange after reading token: got %#v, want %#v", got, want)
+	}
+}
+
