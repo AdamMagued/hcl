@@ -2753,7 +2753,47 @@ block "valid" {}
 				},
 			},
 		},
+		{
+			"/* comment */\na = 1\n",
+			0,
+			&Body{
+				Attributes: Attributes{
+					"a": &Attribute{
+						Name: "a",
+						Expr: &LiteralValueExpr{
+							Val: cty.NumberIntVal(1),
+							SrcRange: hcl.Range{
+								Start: hcl.Pos{Line: 2, Column: 5, Byte: 18},
+								End:   hcl.Pos{Line: 2, Column: 6, Byte: 19},
+							},
+						},
+						SrcRange: hcl.Range{
+							Start: hcl.Pos{Line: 2, Column: 1, Byte: 14},
+							End:   hcl.Pos{Line: 2, Column: 6, Byte: 19},
+						},
+						NameRange: hcl.Range{
+							Start: hcl.Pos{Line: 2, Column: 1, Byte: 14},
+							End:   hcl.Pos{Line: 2, Column: 2, Byte: 15},
+						},
+						EqualsRange: hcl.Range{
+							Start: hcl.Pos{Line: 2, Column: 3, Byte: 16},
+							End:   hcl.Pos{Line: 2, Column: 4, Byte: 17},
+						},
+					},
+				},
+				Blocks: Blocks{},
+				SrcRange: hcl.Range{
+					Start: hcl.Pos{Line: 1, Column: 1, Byte: 0},
+					End:   hcl.Pos{Line: 3, Column: 1, Byte: 20},
+				},
+				EndRange: hcl.Range{
+					Start: hcl.Pos{Line: 3, Column: 1, Byte: 20},
+					End:   hcl.Pos{Line: 3, Column: 1, Byte: 20},
+				},
+			},
+		},
 	}
+
 
 	for _, test := range tests {
 		t.Run(test.input, func(t *testing.T) {
@@ -4329,3 +4369,72 @@ func TestParseConfigDiagnostics(t *testing.T) {
 		})
 	}
 }
+
+func TestParseConfig_leadingCommentSrcRange(t *testing.T) {
+	tests := []struct {
+		name      string
+		src       string
+		wantStart hcl.Pos
+	}{
+		{
+			name: "multiline comment at start",
+			src: `/********************************
+ Some comment
+********************************/
+
+data "google_project" "project" {
+  project_id = var.project_id
+}
+`,
+			wantStart: hcl.Pos{Line: 1, Column: 1, Byte: 0},
+		},
+		{
+			name: "single line hash comment at start",
+			src: `# Some comment
+data "google_project" "project" {
+  project_id = var.project_id
+}
+`,
+			wantStart: hcl.Pos{Line: 1, Column: 1, Byte: 0},
+		},
+		{
+			name: "single line slash comment at start",
+			src: `// Some comment
+data "google_project" "project" {
+  project_id = var.project_id
+}
+`,
+			wantStart: hcl.Pos{Line: 1, Column: 1, Byte: 0},
+		},
+		{
+			name: "no comment at start",
+			src: `data "google_project" "project" {
+  project_id = var.project_id
+}
+`,
+			wantStart: hcl.Pos{Line: 1, Column: 1, Byte: 0},
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			file, diags := ParseConfig([]byte(tc.src), "test.hcl", hcl.InitialPos)
+			if diags.HasErrors() {
+				t.Fatalf("unexpected diagnostics: %s", diags.Error())
+			}
+
+			body, ok := file.Body.(*Body)
+			if !ok {
+				t.Fatalf("expected *Body, got %T", file.Body)
+			}
+
+			if got := body.Range().Start; got != tc.wantStart {
+				t.Errorf("wrong body.Range().Start: got %#v, want %#v", got, tc.wantStart)
+			}
+			if got := body.SrcRange.Start; got != tc.wantStart {
+				t.Errorf("wrong body.SrcRange.Start: got %#v, want %#v", got, tc.wantStart)
+			}
+		})
+	}
+}
+
